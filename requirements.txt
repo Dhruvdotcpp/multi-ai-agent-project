@@ -6,3 +6,4 @@ langchain
 google-genai
 tavily-python
 pydantic
+openai
