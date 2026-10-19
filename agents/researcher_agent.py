@@ -5,6 +5,7 @@ from google import genai
 from google.genai import types
 from tavily import TavilyClient
 from datetime import date
+from agents.llm import generate_with_retry
 
 load_dotenv()
 
@@ -84,7 +85,8 @@ def research(topic: str) -> dict:
 
     for step in range(1, MAX_STEPS + 1):
         is_last = step == MAX_STEPS
-        response = gemini_client.models.generate_content(
+        response = generate_with_retry(
+            gemini_client,
             model=MODEL,
             contents=contents,
             config=final_config if is_last else tool_config,

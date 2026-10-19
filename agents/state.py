@@ -16,6 +16,9 @@ class AgentResult(BaseModel):
     agent: str
     content: str
     sources: list[str] = Field(default_factory=list)
+    source_details: dict[int, dict] = Field(default_factory=dict)
+    trace: list[str] = Field(default_factory=list)
+    stats: dict = Field(default_factory=dict)
 
 
 class VerificationResult(BaseModel):
