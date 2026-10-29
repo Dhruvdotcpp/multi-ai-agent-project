@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
@@ -58,6 +59,17 @@ class Reply:
 class AllProvidersExhausted(RuntimeError):
     pass
 
+# Run-wide usage counter (fresh API calls only; cache hits cost nothing).
+USAGE = {"calls": 0, "tokens": 0}
+
+
+def reset_usage() -> None:
+    USAGE["calls"] = 0
+    USAGE["tokens"] = 0
+
+
+def get_usage() -> dict:
+    return dict(USAGE)
 
 # ---------- The provider pool ----------
 
@@ -87,7 +99,7 @@ def _build_pool() -> list:
     pool = []
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
-        models = os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,llama-3.3-70b-versatile")
+        models = os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b")
         for m in models.split(","):
             if m.strip():
                 pool.append(Endpoint("groq", "https://api.groq.com/openai/v1", groq_key, m.strip()))
@@ -153,59 +165,82 @@ def _call_endpoint(ep: Endpoint, messages, tools, json_mode, temperature) -> Rep
 
 # ---------- Try the pool in order ----------
 
+MAX_TOTAL_WAIT = 240   # seconds ONE call may spend waiting out per-minute limits before giving up
+
+
 def _call_pool(messages, tools, json_mode, temperature) -> Reply:
     last_error = None
+    waited = 0.0
+    skip = set()                  # endpoints to avoid for THIS call only
+    fails = defaultdict(int)      # temporary failures per endpoint, for THIS call only
 
-    for ep in POOL:
-        if ep.dead or time.time() < ep.blocked_until:
+    while True:
+        now = time.time()
+        alive = [ep for ep in POOL if not ep.dead and ep.label not in skip]
+        ready = [ep for ep in alive if now >= ep.blocked_until]
+
+        if not ready:
+            if not alive:
+                break
+            # Everything usable is blocked right now. If the shortest block is brief, wait it out.
+            pause = min(ep.blocked_until for ep in alive) - now
+            if pause > 90 or waited + pause > MAX_TOTAL_WAIT:
+                break
+            pause += 1
+            print(f"[llm] all models are at a per-minute limit, waiting {pause:.0f}s")
+            time.sleep(pause)
+            waited += pause
             continue
 
-        for attempt in range(1, 4):
-            try:
-                return _call_endpoint(ep, messages, tools, json_mode, temperature)
+        ep = ready[0]
+        try:
+            return _call_endpoint(ep, messages, tools, json_mode, temperature)
 
-            except RateLimitError as e:
-                msg = str(e)
-                wait = _parse_wait(msg)
-                last_error = e
-                if _is_daily_limit(msg) or (wait is not None and wait > 90):
-                    ep.blocked_until = time.time() + (wait or 3600)
-                    print(f"[llm] {ep.label}: daily/long limit reached, skipping it for now.")
-                    break  # go to the next endpoint
-                pause = min((wait or 5) + 1, 60)
-                print(f"[llm] {ep.label}: per-minute limit, waiting {pause:.0f}s (attempt {attempt}/3)")
-                time.sleep(pause)
+        except RateLimitError as e:
+            msg = str(e)
+            wait = _parse_wait(msg)
+            last_error = e
+            if _is_daily_limit(msg) or (wait is not None and wait > 90):
+                ep.blocked_until = time.time() + (wait or 3600)
+                print(f"[llm] {ep.label}: daily/long limit reached, skipping it for now.")
+            else:
+                ep.blocked_until = time.time() + (wait or 5)
+                print(f"[llm] {ep.label}: per-minute limit, it will be free again in about {wait or 5:.0f}s")
 
-            except (NotFoundError, AuthenticationError, PermissionDeniedError) as e:
-                ep.dead = True
-                last_error = e
-                print(f"[llm] {ep.label}: unusable ({type(e).__name__}). Check the model name / API key. Skipping it.")
-                break
+        except (NotFoundError, AuthenticationError, PermissionDeniedError) as e:
+            ep.dead = True
+            last_error = e
+            print(f"[llm] {ep.label}: unusable ({type(e).__name__}). Check the model name / API key. Skipping it.")
 
-            except BadRequestError as e:
-                last_error = e
-                if "tool_use_failed" in str(e) and attempt < 3:
-                    print(f"[llm] {ep.label}: malformed tool call, retrying (attempt {attempt}/3)")
-                    continue
-                raise
+        except BadRequestError as e:
+            last_error = e
+            fails[ep.label] += 1
+            if "tool_use_failed" in str(e) and fails[ep.label] < 3:
+                print(f"[llm] {ep.label}: malformed tool call, retrying (attempt {fails[ep.label]}/3)")
+                continue
+            raise
 
-            except (APIConnectionError, InternalServerError) as e:
-                last_error = e
-                pause = 2 ** attempt
+        except (APIConnectionError, InternalServerError) as e:
+            last_error = e
+            fails[ep.label] += 1
+            if fails[ep.label] >= 3:
+                skip.add(ep.label)
+            else:
+                pause = 2 ** fails[ep.label]
                 print(f"[llm] {ep.label}: temporary error ({type(e).__name__}), retrying in {pause}s")
                 time.sleep(pause)
 
-            except APIStatusError as e:
-                last_error = e
-                if e.status_code == 413:
-                    print(f"[llm] {ep.label}: request too large for this model's limits, trying the next one.")
-                    break
+        except APIStatusError as e:
+            last_error = e
+            if e.status_code == 413:
+                skip.add(ep.label)
+                print(f"[llm] {ep.label}: request too large for this model's limits, trying the next one.")
+            else:
                 raise
 
     raise AllProvidersExhausted(
         f"Every provider/model in the pool is exhausted or unavailable. Last error: {last_error}"
     )
-
 
 # ---------- Public functions the agents use ----------
 
@@ -224,6 +259,8 @@ def chat(messages: list, tools: Optional[list] = None, json_mode: bool = False,
         )
 
     reply = _call_pool(messages, tools, json_mode, temperature)
+    USAGE["calls"] += 1
+    USAGE["tokens"] += reply.tokens
     cache_set("llm", key, {
         "content": reply.content,
         "tool_calls": [asdict(t) for t in reply.tool_calls],

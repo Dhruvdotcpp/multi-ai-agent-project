@@ -30,6 +30,8 @@ Rules:
 - Subtasks should cover different angles and must not overlap.
 - Do NOT create a subtask for writing the final report. A different agent does that.
 - If the task is already narrow, 1 or 2 subtasks is correct. Do not pad.
+- Ask questions that web articles and papers can plausibly answer. Do not demand statistical
+  significance or exact numeric metrics unless they are essential to the task.
 - Put your breakdown in "subtasks" (a list of strings) and a one or two sentence
   explanation in "rationale".
 

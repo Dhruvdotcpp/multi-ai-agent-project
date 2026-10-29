@@ -8,6 +8,8 @@ from tavily import TavilyClient
 from agents.cache import cache_get, cache_set
 from agents.llm import chat
 
+from agents.textutil import clean_text
+
 load_dotenv()
 
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
@@ -28,7 +30,10 @@ Process:
 Rules:
 - Use ONLY information found in the search results.
 - Cite every claim with [Source N], using the source numbers shown in the results.
-- If something could not be found, say so instead of guessing.
+- If something could not be found, say so in a separate line that starts with "Gap:" instead of guessing.
+- Never state a number, percentage, date or named result unless it appears in a source.
+  Fewer well-supported claims are better than many weak ones.
+- Every sentence must be traceable to a specific source. Do not add background knowledge from memory.
 - For questions about recent, latest or current events, include the current year in your
   queries and prefer the newest sources. If the results look older than expected, say so."""
 
@@ -76,14 +81,15 @@ def register_sources(results: list[dict], sources: dict) -> str:
     for r in results:
         if r["url"] not in url_to_id:
             sid = len(sources) + 1
-            sources[sid] = {"title": r["title"], "url": r["url"], "content": r["content"]}
+            sources[sid] = {"title": clean_text(r["title"]), "url": r["url"], "content": clean_text(r["content"])}
             url_to_id[r["url"]] = sid
         sid = url_to_id[r["url"]]
-        text += f"Source {sid}: {r['title']}\nURL: {r['url']}\nContent: {r['content']}\n\n"
+        s = sources[sid]
+        text += f"Source {sid}: {s['title']}\nURL: {s['url']}\nContent: {s['content']}\n\n"
     return text
 
 
-def research(topic: str) -> dict:
+def research(topic: str, feedback: str = "", avoid_queries: list = None) -> dict:
     """
     Tool-calling research agent. The model decides what to search and when to stop.
     Returns notes plus the sources, a decision trace, and run statistics.
@@ -95,10 +101,30 @@ def research(topic: str) -> dict:
     searches = 0
     llm_calls = 0
     notes = ""
+    queries: list[str] = []
+    avoid = {q.strip().lower() for q in (avoid_queries or [])}
+
+    user_message = f"Research this: {topic}"
+    if feedback:
+        user_message += (
+            "\n\nA fact-checker reviewed your previous notes on this question and found problems:\n"
+            f"{feedback}\n\n"
+        )
+        if avoid_queries:
+            user_message += (
+                "Queries already tried (do NOT repeat them, use different angles):\n"
+                + "\n".join(f"- {q}" for q in avoid_queries) + "\n\n"
+            )
+        user_message += (
+            "Rewrite your COMPLETE notes so they answer the whole research question again. "
+            "Drop every flagged claim unless a NEW search finds a source that states it, and do not "
+            "restate a flagged claim in different words. You may also search for other evidence the "
+            "question needs. Every number, percentage and date must appear in a source."
+        )
 
     messages = [
         {"role": "system", "content": f"Today's date is {date.today():%B %d, %Y}.\n\n{SYSTEM_PROMPT}"},
-        {"role": "user", "content": f"Research this: {topic}"},
+        {"role": "user", "content": user_message},
     ]
 
     for step in range(1, MAX_STEPS + 1):
@@ -115,7 +141,7 @@ def research(topic: str) -> dict:
         total_tokens += reply.tokens
 
         if not reply.tool_calls:
-            notes = reply.content or ""
+            notes = clean_text(reply.content or "")
             msg = f"step {step}: model wrote final notes [{reply.provider}]"
             trace.append(msg)
             print(msg)
@@ -126,6 +152,19 @@ def research(topic: str) -> dict:
 
         for call in reply.tool_calls:
             query = str(call.args.get("query", "")).strip() or topic
+
+            if query.lower() in avoid:
+                msg = f"step {step}: blocked a repeated query -> '{query}'"
+                trace.append(msg)
+                print(msg)
+                messages.append({
+                    "role": "tool", "tool_call_id": call.id,
+                    "content": "BLOCKED: this query was already tried in an earlier attempt and returned "
+                               "the same sources. Use a substantially different query.",
+                })
+                continue
+
+            queries.append(query)
             t0 = time.time()
             results = run_search(query)
             result_text = register_sources(results, sources)
@@ -144,12 +183,12 @@ def research(topic: str) -> dict:
         "trace": trace,
         "stats": {
             "searches": searches,
+            "queries": queries,
             "llm_calls": llm_calls,
             "total_tokens": total_tokens,
             "seconds": round(time.time() - start, 1),
         },
     }
-
 
 if __name__ == "__main__":
     result = research("What are the main benefits of using multi-agent AI systems?")

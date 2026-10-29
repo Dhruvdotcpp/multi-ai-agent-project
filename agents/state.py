@@ -9,6 +9,8 @@ class Subtask(BaseModel):
     description: str
     assigned_agent: Literal["researcher", "analyst"]
     status: Literal["pending", "in_progress", "done", "failed"] = "pending"
+    attempts: int = 0     
+    feedback: str = ""     
 
 
 class AgentResult(BaseModel):
@@ -21,11 +23,25 @@ class AgentResult(BaseModel):
     stats: dict = Field(default_factory=dict)
 
 
+class ClaimCheck(BaseModel):
+    claim: str
+    cited_sources: list[int] = Field(default_factory=list)
+    verdict: Literal["supported", "unsupported", "contradicted", "uncited"]
+    evidence: str = ""
+    evidence_found: bool = False   
+    reason: str = ""
+
+
 class VerificationResult(BaseModel):
     subtask_id: int
     approved: bool
+    claims: list[ClaimCheck] = Field(default_factory=list)
+    support_rate: float = 0.0
+    invalid_citations: list[int] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
     feedback: str = ""
+    error: str = ""               
 
 
 class AgentState(TypedDict):
